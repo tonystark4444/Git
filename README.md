@@ -57,27 +57,43 @@ so start with a smaller `--ctx-size` (see below) unless you have a lot of memory
 
 ## Setup
 
+Run the server and the chat client in **separate terminals** — `run_server.sh`
+runs in the foreground.
+
+### CPU only, default quant (Q4_K_M)
+
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-# 1. Build llama.cpp (add --cuda if you have an NVIDIA GPU)
-./scripts/build_llama_cpp.sh [--cuda]
-
-# 2. Download a quant (defaults to Q4_K_M) + the vision projector
-./scripts/download_model.sh [QUANT]
-
-# 3. Start the OpenAI-compatible server
-./scripts/run_server.sh [QUANT] [CTX_SIZE] [PORT]
-
-# 4. Chat with it
-python scripts/chat.py                # thinking mode (default)
-python scripts/chat.py --no-thinking  # instruct mode
+./scripts/build_llama_cpp.sh
+./scripts/download_model.sh
+./scripts/run_server.sh
+python scripts/chat.py
 ```
+
+### NVIDIA GPU, explicit quant / context / port
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+./scripts/build_llama_cpp.sh --cuda
+./scripts/download_model.sh Q4_K_M
+./scripts/run_server.sh Q4_K_M 32768 8080
+python scripts/chat.py
+```
+
+### Script arguments
+
+| Script | Arguments | Defaults |
+|---|---|---|
+| `build_llama_cpp.sh` | `--cuda` to enable an NVIDIA GPU build | CPU-only |
+| `download_model.sh` | `QUANT` `DEST_DIR` | `Q4_K_M` `models` |
+| `run_server.sh` | `QUANT` `CTX_SIZE` `PORT` | `Q4_K_M` `32768` `8080` |
+| `chat.py` | `--no-thinking`, `--base-url`, `--model`, `--system`, `--max-tokens` | thinking mode, `http://localhost:8080/v1` |
 
 `scripts/chat.py` applies the sampling parameters recommended by the model
 card, which differ between thinking and instruct mode (temperature, top_p,
-top_k, min_p, presence_penalty).
+top_k, min_p, presence_penalty). Use `--no-thinking` for instruct mode.
 
 You can also talk to the server with any OpenAI-compatible client pointed at
 `http://localhost:8080/v1`, or use `llama.cpp/build/bin/llama-mtmd-cli` for a
