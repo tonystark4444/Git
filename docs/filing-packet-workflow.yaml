@@ -1,0 +1,484 @@
+# filing-packet-workflow.yaml
+# Schema-first deterministic workflow engine for regulatory filing packets
+# Compatible with Z3 solver validation, FastAPI/Pydantic, Kafka event sourcing
+
+version: "1.0.0"
+namespace: "sovereign.financial.infrastructure.filing"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CORE TYPE DEFINITIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+types:
+  FilingPacketID:
+    type: string
+    pattern: "^H8RMMF-[1-3]$|^TCR-\\d{8}-\\d{4}$|^FINRA-COMP-\\d{8}-\\d{4}$|^DTC-ESC-\\d{8}-\\d{4}$"
+    description: "Immutable filing packet identifier with embedded taxonomy"
+
+  CustodianID:
+    type: string
+    enum: ["APEX_CLEARING", "NFS_FIDELITY", "TRADEUP_PLYNK", "DTC_PARTICIPANT"]
+    description: "Canonical custodian/participant identifiers"
+
+  FilingType:
+    type: string
+    enum:
+      - "H8RMMF_1_APEX_STATEMENT_FAILURE"      # FINRA 2231/4311(c)(2) → Apex CCO
+      - "H8RMMF_2_NFS_POSITION_GAP"            # FINRA 2231/4311(c)(2) → NFS via Plynk
+      - "H8RMMF_3_NFS_POSITION_GAP"            # Conditional on verification
+      - "TCR_SEA_17A3_17A4_BOOKS_RECORDS"      # SEC TCR portal, single narrative
+      - "FINRA_INVESTOR_COMPLAINT_2231_4311"   # FINRA Investor Complaint portal
+      - "DTC_PARTICIPANT_DISCREPANCY_4311"     # DTC participant position discrepancy
+      - "DTC_ESCALATION_COMPLIANCE"            # 10-business-day written response demand
+    description: "Exhaustive filing type taxonomy — one violation, one filing"
+
+  RegulatoryCitation:
+    type: object
+    required: [rule, description, enforcement_action]
+    properties:
+      rule: { type: string, pattern: "^(SEC|FINRA|DTC|SEA)\\s+\\d+[A-Z]?\\-\\d+[A-Z]?(\\\(\\\\w+\\\\))?$" }
+      description: { type: string }
+      enforcement_action: { type: string, enum: ["no_action", "wells_notice", "awc", "complaint", "bar"] }
+
+  EvidenceArtifact:
+    type: object
+    required: [artifact_id, type, hash_sha256, source_uri, retrieved_at, chain_of_custody]
+    properties:
+      artifact_id: { type: string, pattern: "^EV-\\d{8}-\\d{6}-[A-F0-9]{8}$" }
+      type: { type: string, enum: ["BROKERCHECK_SNAPSHOT", "AWC_TEXT", "DTC_POSITION_REPORT", "PROXY_STATEMENT", "DTC_PARTICIPANT_DIR", "ACCOUNT_STATEMENT", "TRANSACTION_HISTORY", "CORPORATE_ACTION_NOTICE", "CALL_LOG", "EMAIL_CORRESPONDENCE", "COMPLIANCE_ESCALATION_EMAIL"] }
+      hash_sha256: { type: string, pattern: "^[a-f0-9]{64}$" }
+      source_uri: { type: string, format: "uri" }
+      retrieved_at: { type: string, format: "date-time" }
+      chain_of_custody: { type: array, items: { type: string } }
+
+  FilingPacket:
+    type: object
+    required: [packet_id, filing_type, custodian, regulatory_citations, evidence_artifacts, narrative, deadlines, submission_target]
+    properties:
+      packet_id: { $ref: "#/types/FilingPacketID" }
+      filing_type: { $ref: "#/types/FilingType" }
+      custodian: { $ref: "#/types/CustodianID" }
+      regulatory_citations: { type: array, items: { $ref: "#/types/RegulatoryCitation" }, minItems: 1 }
+      evidence_artifacts: { type: array, items: { $ref: "#/types/EvidenceArtifact" }, minItems: 1 }
+      narrative: { type: string, minLength: 500, maxLength: 10000 }
+      deadlines:
+        type: object
+        required: [response_due, escalation_trigger, statute_of_limitations]
+        properties:
+          response_due: { type: string, format: "date-time" }
+          escalation_trigger: { type: string, format: "date-time" }
+          statute_of_limitations: { type: string, format: "date-time" }
+      submission_target:
+        type: object
+        required: [portal, api_endpoint, authentication_method]
+        properties:
+          portal: { type: string, enum: ["FINRA_INVESTOR_COMPLAINT", "SEC_TCR", "FINRA_BROKERCHECK", "DTC_PARTICIPANT_PORTAL", "BROADRIDGE_PROXYPULSE", "CCO_EMAIL", "COMPLIANCE_PORTAL"] }
+          api_endpoint: { type: string, format: "uri" }
+          authentication_method: { type: string, enum: ["OAUTH2_CLIENT_CREDENTIALS", "API_KEY", "MUTUAL_TLS", "CERT_BASED"] }
+      status: { type: string, enum: ["DRAFT", "VALIDATED", "SUBMITTED", "ACKNOWLEDGED", "ESCALATED", "CLOSED", "NO_ACTION"] }
+      created_at: { type: string, format: "date-time" }
+      updated_at: { type: string, format: "date-time" }
+      submitted_at: { type: string, format: "date-time", nullable: true }
+      reference_numbers: { type: array, items: { type: string } }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WORKFLOW STATE MACHINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+workflow:
+  states:
+    - DRAFT
+    - EVIDENCE_COLLECTION
+    - SCHEMA_VALIDATION
+    - Z3_CONSTRAINT_CHECK
+    - COMPLIANCE_REVIEW
+    - SUBMISSION_QUEUE
+    - SUBMITTED
+    - ACKNOWLEDGED
+    - RESPONSE_RECEIVED
+    - ESCALATION_PENDING
+    - ESCALATED
+    - CLOSED
+    - NO_ACTION_LETTER
+
+  transitions:
+    - from: DRAFT
+      to: EVIDENCE_COLLECTION
+      trigger: initiate_evidence_gathering
+      conditions: ["has_filing_type", "has_custodian"]
+    - from: EVIDENCE_COLLECTION
+      to: SCHEMA_VALIDATION
+      trigger: evidence_complete
+      conditions: ["all_artifacts_collected", "hashes_verified"]
+    - from: SCHEMA_VALIDATION
+      to: Z3_CONSTRAINT_CHECK
+      trigger: schema_valid
+      conditions: ["pydantic_valid", "required_fields_present"]
+    - from: Z3_CONSTRAINT_CHECK
+      to: COMPLIANCE_REVIEW
+      trigger: constraints_satisfied
+      conditions: ["z3_sat", "regulatory_citations_valid", "deadlines_feasible"]
+    - from: COMPLIANCE_REVIEW
+      to: SUBMISSION_QUEUE
+      trigger: compliance_approved
+      conditions: ["narrative_reviewed", "exhibits_labeled", "escalation_path_defined"]
+    - from: SUBMISSION_QUEUE
+      to: SUBMITTED
+      trigger: submit_to_portal
+      conditions: ["api_available", "auth_valid"]
+    - from: SUBMITTED
+      to: ACKNOWLEDGED
+      trigger: portal_acknowledgment
+      conditions: ["reference_number_received"]
+    - from: ACKNOWLEDGED
+      to: RESPONSE_RECEIVED
+      trigger: response_received
+      conditions: ["within_response_deadline"]
+    - from: ACKNOWLEDGED
+      to: ESCALATION_PENDING
+      trigger: deadline_breached
+      conditions: ["past_response_due", "no_response"]
+    - from: ESCALATION_PENDING
+      to: ESCALATED
+      trigger: file_escalation
+      conditions: ["escalation_packet_ready"]
+    - from: RESPONSE_RECEIVED
+      to: CLOSED
+      trigger: resolution_accepted
+      conditions: ["documents_received", "positions_verified"]
+    - from: ESCALATED
+      to: CLOSED
+      trigger: regulatory_action
+      conditions: ["awc_issued", "fine_levied", "bar_ordered"]
+    - from: "*"
+      to: NO_ACTION_LETTER
+      trigger: no_action_received
+      conditions: ["finra_no_action_letter_received"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTOMATED EVIDENCE COLLECTION PIPELINES
+# ─────────────────────────────────────────────────────────────────────────────
+
+evidence_pipelines:
+  BROKERCHECK_SNAPSHOT:
+    source: "finance_connector.finra.brokercheck"
+    method: "GET /brokercheck/v1/firm/{crd_number}"
+    params:
+      crd_number: { type: string, pattern: "^\\d{1,6}$" }
+    output: EvidenceArtifact
+    transformation: |
+      artifact_id = f"EV-{datetime.now():%Y%m%d-%H%M%S}-{sha256(response.content)[:8].upper()}"
+      return EvidenceArtifact(
+        artifact_id=artifact_id,
+        type="BROKERCHECK_SNAPSHOT",
+        hash_sha256=sha256(response.content).hexdigest(),
+        source_uri=f"https://api.finra.org/brokercheck/v1/firm/{crd_number}",
+        retrieved_at=datetime.utcnow().isoformat(),
+        chain_of_custody=[f"finance_connector@{socket.gethostname()}"]
+      )
+
+  AWC_TEXT:
+    source: "finance_connector.finra.disciplinary_actions"
+    method: "GET /disciplinary/actions/{awc_number}"
+    params:
+      awc_number: { type: string, pattern: "^\\d{8}$" }
+    output: EvidenceArtifact
+    transformation: similar_to_above
+
+  DTC_POSITION_REPORT:
+    source: "custodian_dtc_portal"  # Requires prime broker DTC access
+    method: "POST /participant/position/query"
+    params:
+      cusip: { type: string, pattern: "^\\d{9}$" }
+      participant_ids: { type: array, items: { type: string, pattern: "^\\d{4}$" } }
+      as_of_date: { type: string, format: "date" }
+    output: EvidenceArtifact
+    notes: "Requires Broadridge/ProxyPulse API or custodian DTC participant portal credentials"
+
+  DTC_PARTICIPANT_DIR:
+    source: "finance_connector.dtc.participant_directory"
+    method: "GET /participants"
+    output: EvidenceArtifact
+
+  PROXY_STATEMENT:
+    source: "broadridge_proxypulse"
+    method: "GET /proxy/v1/statements/{control_number}"
+    params:
+      control_number: { type: string }
+    output: EvidenceArtifact
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUBMISSION ADAPTERS (FINRA/SEC/DTC APIs)
+# ─────────────────────────────────────────────────────────────────────────────
+
+submission_adapters:
+  FINRA_INVESTOR_COMPLAINT:
+    api_base: "https://api.finra.org/investor-complaint/v1"
+    auth: "OAUTH2_CLIENT_CREDENTIALS"
+    endpoint: "/complaints"
+    payload_mapping: |
+      {
+        "complaintType": "INVESTOR_COMPLAINT",
+        "firmCRDNumber": packet.custodian.crd_number,
+        "complaintText": packet.narrative,
+        "attachments": [
+          {"artifactId": a.artifact_id, "content": base64(a.content), "hash": a.hash_sha256}
+          for a in packet.evidence_artifacts
+        ],
+        "regulatoryCitations": [c.rule for c in packet.regulatory_citations],
+        "requestedRelief": "WRITTEN_RESPONSE_10_BUSINESS_DAYS"
+      }
+    response_schema:
+      complaintId: string
+      status: string
+      submittedAt: datetime
+
+  SEC_TCR:
+    api_base: "https://api.sec.gov/tcr/v1"
+    auth: "CERT_BASED"
+    endpoint: "/tips-complaints-referrals"
+    payload_mapping: |
+      {
+        "submissionType": "TCR",
+        "narrative": packet.narrative,
+        "entities": [{"name": packet.custodian.name, "crdNumber": packet.custodian.crd_number}],
+        "violations": [{"rule": c.rule, "description": c.description} for c in packet.regulatory_citations],
+        "exhibits": [{"id": a.artifact_id, "description": a.type, "hash": a.hash_sha256} for a in packet.evidence_artifacts]
+      }
+
+  DTC_ESCALATION:
+    api_base: "https://dtcc-api.broadridge.com/participant/v1"
+    auth: "MUTUAL_TLS"
+    endpoint: "/escalations"
+    payload_mapping: |
+      {
+        "cusip": packet.evidence_artifacts[0].metadata.cusip,
+        "participantIds": packet.evidence_artifacts[0].metadata.participant_ids,
+        "discrepancyType": "POSITION_MISMATCH",
+        "proxyEvidence": packet.evidence_artifacts.filter(a => a.type == "PROXY_STATEMENT"),
+        "demandWrittenResponseDays": 10,
+        "regulatoryCitations": [c.rule for c in packet.regulatory_citations]
+      }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Z3 CONSTRAINT DEFINITIONS
+# ─────────────────────────────────────────────────────────────────────────────
+ ─────────────────────────────────────────────────────────────────
+# Z3 CONSTRAINT DEFINITIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+z3_constraints:
+  - Filing_defined:
+      from:
+      ]","      pattern  "^H8RMMF_FILING13.SAT(\\d{1,6})?\""type: "str
+
+      pattern:  "t_FILING ^[HCON"]
+        pattern:  - from: ^H8RMMF-[H8RMMF_1_APEX_STATEMENT_FAILURE:
+  1]$", to: "
+   description: "  1_H8RMMF_REGULA - H8RMMF-2_NF  _1_APEX_STATEMENT_FAILURE->H8RMMF-2_NFS_POSITION_GAP",
+      pattern: "  trigger: ^(SEC|FINRA|DTC|SEA)_17a3_17a4_compliance",
+      description:  "conditions: ["evidence_complete", "regulatory_citations_valid"]
+  - from: "H8RMMF_2_NFS_POSITION_GAP"
+    to: "H8RMMF_3_NFS_POSITION_GAP"
+    trigger: "verification_confirmed"
+    conditions: ["position_gap_verified"]
+
+  DEADLINE_FEASIBILITY:
+    constraint: "response_due > now() + 10_business_days"
+    description: "10-business-day response deadline must be achievable"
+
+  REGULATORY_CITATION_CITATION:
+    constraint: "forall c in regulatory_citations: "all c.rule in known_citations.citations)",
+    description: "description citations must reference fromrules"source"
+
+  CUSTODIAN_FILING_ESCALATION_CALITY_ALIGNMENT: constraint: "forcustodian in packet".c = "_id"odian
+  .
+
+"O"
+TYPE_MATCH", "",
+ "pattern: [
+   "^H8RMMF- "constraintRMMF-1_REGEX_STATEMENT_FAILURE->  TC1_R1_17A_17_4311A3C(_2) C"
+   ", ]
+  " "descriptionH8RMMF": "2_N"EachFILINGS_TYPE_hasTE_MATERI_CIAl FILINGS
+=on "
+       "exact": custodian": ",
+  "
+  "regulatory_citation": ["
+  ]
+}
+   "H8RMMF_1_APEX_STATEMENT_FAILURE"# ─────────────────────────────────────────────────────────────────────────────
+]  # ─────────────────────────────────────────────────────────────────────────────
+# API CONNECTOR CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+api_connectors:
+  finance:
+    base_url: "https://api.finra.org"
+    endpoints:
+      brokercheck: "/brokercheck/v1/firm/{crd}"
+      disciplinary_actions: "/disciplinary/actions/{awc_number}"
+      dtc_participant_directory: "/dtc/participants"
+    auth:
+      type: "OAUTH2_CLIENT_CREDENTIALS"
+      token_url: "https://api.finra.org/oauth2/token"
+      scopes: ["brokercheck:read", "disciplinary:read", "dtc:read"]
+
+  github_mcp_direct:
+    base_url: "https://api.github.com"
+    endpoints:
+      schema_registry: "/repos/{owner}/{repo}/contents/schemas/filing-packet"
+      workflow_runs: "/repos/{owner}/{repo}/actions/workflows/filing-engine.yml/runs"
+    auth:
+      type: "BEARER_TOKEN"
+      token_env: "GITHUB_MCP_TOKEN"
+
+  broadridge_proxypulse:
+    base_url: "https://api.broadridge.com/proxypulse/v1"
+    auth:
+      type: "MUTUAL_TLS"
+      cert_env: "BROADRIDGE_CLIENT_CERT"
+      key_env: "BROADRIDGE_CLIENT_KEY"
+    endpoints:
+      proxy_statements: "/statements/{control_number}"
+      position_reports: "/positions/{cusip}/{participant_id}"
+
+  dtc_participant_portal:
+    base_url: "https://dtcc-api.broadridge.com/participant/v1"
+    auth:
+      type: "CERT_BASED"
+      cert_env: "DTC_CLIENT_CERT"
+    endpoints:
+      position_query: "/positions/query"
+      participant_directory: "/directory"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUDIT & COMPLIANCE LOGGING
+# ─────────────────────────────────────────────────────────────────────────────
+
+audit_log:
+  events:
+    - PACKET_CREATED
+    - EVIDENCE_COLLECTED
+    - SCHEMA_VALIDATED
+    - Z3_CHECK_PASSED
+    - Z3_CHECK_FAILED
+    - COMPLIANCE_REVIEWED
+    - SUBMITTED_TO_PORTAL
+    - PORTAL_ACKNOWLEDGED
+    - RESPONSE_RECEIVED
+    - ESCALATION_FILED
+    - DEADLINE_BREACHED
+    - PACKET_CLOSED
+  retention: "7_years"
+  storage:
+    - type: "kafka"
+      topic: "sovereign.filing.audit"
+      partitions: 32
+    - type: "postgresql"
+      table: "filing_audit_log"
+      partition_by: "packet_id"
+  immutable: true
+  tamper_evident: true
+  merkle_tree: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEPLOYMENT CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+deployment:
+  engine:
+    runtime: "python:3.12-slim"
+    framework: "fastapi"
+    validation: "pydantic_v2"
+    solver: "z3-solver>=4.12"
+    event_bus: "kafka"
+    schema_registry: "confluent-schema-registry"
+
+  scaling:
+    min_replicas: 2
+    max_replicas: 10
+    target_cpu: 70
+
+  monitoring:
+    metrics:
+      - filing_packet_throughput
+      - z3_solve_latency_p99
+      - api_submission_success_rate
+      - deadline_compliance_rate
+    alerts:
+      - name: "deadline_breach_imminent"
+        condition: "response_due < now() + 2_business_days && status == ACKNOWLEDGED"
+      - name: "z3_unsat"
+        condition: "z3_check_result == UNSAT"
+      - name: "submission_failure"
+        condition: "submission_success_rate < 0.95"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INSTANTIATION EXAMPLE: H8RMMF-1
+# ─────────────────────────────────────────────────────────────────────────────
+
+example_packet_h8rmmf_1:
+  packet_id: "H8RMMF-1"
+  filing_type: "H8RMMF_1_APEX_STATEMENT_FAILURE"
+  custodian: "APEX_CLEARING"
+  regulatory_citations:
+    - rule: "FINRA 2231"
+      description: "Failure to provide account statements"
+      enforcement_action: "complaint"
+    - rule: "FINRA 4311(c)(2)"
+      description: "Failure to provide information upon request"
+      enforcement_action: "complaint"
+    - rule: "SEA Rule 17a-3(a)(1)"
+      description: "Recordkeeping - customer account records"
+      enforcement_action: "complaint"
+    - rule: "SEA Rule 17a-4(b)(1)"
+      description: "Record preservation - account records"
+      enforcement_action: "complaint"
+  evidence_artifacts:
+    - artifact_id: "EV-20260824-113000-A1B2C3D4"
+      type: "BROKERCHECK_SNAPSHOT"
+      hash_sha256: "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456"
+      source_uri: "https://api.finra.org/brokercheck/v1/firm/18483"
+      retrieved_at: "2026-08-24T11:30:00Z"
+      chain_of_custody: ["finance_connector@filing-engine-01"]
+    - artifact_id: "EV-20260824-113001-E5F6A7B8"
+      type: "AWC_TEXT"
+      hash_sha256: "f6e5d4c3b2a109876543210fedcba9876543210fedcba9876543210fedcba987"
+      source_uri: "https://api.finra.org/disciplinary/actions/202307765"
+      retrieved_at: "2026-08-24T11:30:05Z"
+      chain_of_custody: ["finance_connector@filing-engine-01"]
+    - artifact_id: "EV-20260824-113002-1A2B3C4D"
+      type: "PROXY_STATEMENT"
+      hash_sha256: "1a2b3c4d5e6f7890abcdef1234567890abcdef1234567890abcdef1234567890"
+      source_uri: "https://api.broadridge.com/proxypulse/v1/statements/V88439-P44696-010"
+      retrieved_at: "2026-08-24T11:30:10Z"
+      chain_of_custody: ["broadridge_proxypulse@filing-engine-01"]
+  narrative: |
+    H8RMMF-1: Apex Clearing (CRD #18483) Statement Delivery Failure
+
+    On [DATE], Account [REDACTED] held positions including DKNG (CUSIP 253031108)
+    at Apex Clearing via introducing broker TradeUP (CRD #18483). Despite regulatory
+    obligations under SEA Rule 17a-3(a)(1) and 17a-4(b)(1) to maintain and preserve
+    customer account records, and FINRA Rules 2231 and 4311(c)(2) requiring statement
+    delivery and information provision upon request, Apex Clearing has failed to
+    deliver account statements for the period [PERIOD].
+
+    The beneficial ownership of DKNG shares is evidenced by Proxy Control Number
+    0331 8403 3464 0589 (Ref V88439-P44696-010) which confirms the account holder's
+    position. Apex Clearing's April 2025 AWC (#202307765, $700k fine) for AML and
+    books-and-records failures under Rules 3110, 3130, 17a-3/4, and 4311 demonstrates
+    a pattern of supervisory and recordkeeping deficiencies.
+
+    Demand: Written response within 10 business days per FINRA Rule 4311(c)(2)
+    with full positions, transaction history, and statement delivery timeline.
+  deadlines:
+    response_due: "2026-09-07T17:00:00-04:00"  # 10 business days
+    escalation_trigger: "2026-09-08T09:30:00-04:00"
+    statute_of_limitations: "2029-08-24T11:30:00-04:00"
+  submission_target:
+    portal: "CCO_EMAIL"
+    api_endpoint: "mailto:cco@apexclearing.com"
+    authentication_method: "CERT_BASED"
+  status: "DRAFT"
+  created_at: "2026-08-24T11:30:00-04:00"
+  updated_at: "2026-08-24T11:30:00-04:00"
