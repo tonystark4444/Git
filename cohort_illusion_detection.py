@@ -187,8 +187,9 @@ class CohortTracker:
         self.flow_history.append(flow)
 
         # Update wallet balance
-        if flow.wallet_address in self.wallets:
-            wallet = self.wallets[flow.wallet_address]
+        normalized_addr = flow.wallet_address.lower()
+        if normalized_addr in self.wallets:
+            wallet = self.wallets[normalized_addr]
             if flow.flow_type == "inflow":
                 wallet.balance_btc += flow.amount_btc
             else:
@@ -262,21 +263,23 @@ class CohortTracker:
 
     def calculate_entity_adjusted_balance(self, start_date: datetime, end_date: datetime) -> float:
         """
-        Calculate entity-adjusted balance (excludes known custodial flows).
+        Calculate entity-adjusted net flow (inflows minus outflows) within the
+        given window, excluding flows attributed to known custodial entities.
+
+        Mirrors calculate_whale_accumulation's windowing so both figures are
+        flow quantities over the same period and are comparable.
         """
-        total_balance = 0.0
+        total_flow = 0.0
 
-        for entity_id, entity in self.entities.items():
-            if entity.is_custodial:
-                continue  # Skip custodial entities
+        for flow in self.flow_history:
+            if start_date <= flow.timestamp <= end_date:
+                wallet = self.wallets.get(flow.wallet_address.lower())
+                if wallet and wallet.entity_id:
+                    entity = self.entities.get(wallet.entity_id)
+                    if entity and not entity.is_custodial:
+                        total_flow += flow.amount_btc if flow.flow_type == "inflow" else -flow.amount_btc
 
-            # Sum balances for non-custodial entities
-            for addr in entity.wallet_addresses:
-                wallet = self.wallets.get(addr.lower())
-                if wallet:
-                    total_balance += wallet.balance_btc
-
-        return total_balance
+        return total_flow
 
     def detect_illusion_events(self, end_date: datetime, window_days: int = 30):
         """
@@ -296,14 +299,14 @@ class CohortTracker:
         current_date = start_date
 
         # Collect divergence data points (daily)
-        while current_date <= end_date:
+        while current_date < end_date:
             daily_raw = self.calculate_whale_accumulation(
                 current_date, current_date + timedelta(days=1)
             )
             daily_entity = self.calculate_entity_adjusted_balance(
                 current_date, current_date + timedelta(days=1)
             )
-            if daily_entity > 0:  # Avoid division by zero
+            if abs(daily_entity) > 1e-9:  # Avoid division by zero
                 divergence = (daily_raw - daily_entity) / daily_entity
                 divergences.append(divergence)
             current_date += timedelta(days=1)
@@ -311,7 +314,7 @@ class CohortTracker:
         # Calculate standard deviation of divergences
         if divergences:
             std_dev = np.std(divergences)
-            current_divergence = (raw_accumulation - entity_balance) / entity_balance if entity_balance > 0 else 0
+            current_divergence = (raw_accumulation - entity_balance) / entity_balance if abs(entity_balance) > 1e-9 else 0
 
             # Check if divergence exceeds threshold
             if abs(current_divergence) > Config.DIVERGENCE_THRESHOLD * std_dev:
@@ -321,7 +324,10 @@ class CohortTracker:
                     cohort_id="all_whales",
                     raw_whale_accumulation=raw_accumulation,
                     entity_adjusted_balance=entity_balance,
-                    divergence_std=current_divergence / std_dev if std_dev > 0 else 0,
+                    divergence_std=(
+                        current_divergence / std_dev if std_dev > 0
+                        else (float("inf") if current_divergence != 0 else 0.0)
+                    ),
                     severity="high" if abs(current_divergence) > 2 * std_dev else "medium",
                     details={
                         "window_start": start_date.isoformat(),
@@ -333,7 +339,7 @@ class CohortTracker:
                     }
                 )
                 self.flags.append(flag)
-                print(f"🚩 Illusion Flag: {flag.flag_id} | Divergence: {current_divergence:.2%} | Std Dev: {flag.divergence_std:.2f}")
+                print(f"🚩 Illusion Flag: {flag.flag_id} | Divergence: {current_divergence:.2%} | Sigma: {flag.divergence_std:.2f}σ")
 
 
 # =============================================================================
