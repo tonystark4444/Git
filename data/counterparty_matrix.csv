@@ -1,0 +1,9 @@
+payer_name,account_status,dispute_tier,notes
+Coinbase,active,no,1099 expected 2022+; CSV coverage ends July 2022
+Robinhood,active,no,1099-B expected; PDF statement in Drive
+Webull,active,no,1099-B expected; Gmail confirmed
+Cash App,active,no,1099-B expected; Gmail confirmed
+Plynk/NFS,disputed,yes,Disputed -- SPAX proceeds
+TD Ameritrade/Schwab,disputed,yes,Disputed account
+IBKR,unknown,no,Not in Gmail scan -- confirm via transcript
+Binance,n/a,no,No US EIN reporting expected
